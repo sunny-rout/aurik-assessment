@@ -87,6 +87,56 @@ def test_normalize_batch_only_touches_its_own_batch():
         db.close()
 
 
+def test_normalize_batch_reenqueues_itself_when_records_still_pending(monkeypatch):
+    """Regression test: normalize_events() swallows unexpected per-record
+    errors and leaves the record `pending` rather than raising, so the RQ
+    job reports success either way. Without an explicit re-enqueue, nothing
+    would ever re-attempt that record. This verifies normalize_batch notices
+    a nonzero `pending` count and schedules another attempt."""
+    calls = []
+
+    class FakeQueue:
+        def enqueue(self, *args, **kwargs):
+            calls.append(("enqueue", args))
+
+        def enqueue_in(self, *args, **kwargs):
+            calls.append(("enqueue_in", args))
+
+    monkeypatch.setattr(processing_jobs, "normalize_events", lambda db, events: {
+        "counts": {"normalized": 0, "failed": 0, "pending": 1},
+        "affected_machines": set(),
+    })
+    monkeypatch.setattr(processing_jobs, "get_queue", lambda: FakeQueue())
+
+    processing_jobs.normalize_batch("00000000-0000-0000-0000-000000000000")
+
+    reenqueue_calls = [c for c in calls if c[0] == "enqueue_in"]
+    assert len(reenqueue_calls) == 1
+    assert reenqueue_calls[0][1][1] == processing_jobs.normalize_batch
+    assert reenqueue_calls[0][1][2] == "00000000-0000-0000-0000-000000000000"
+
+
+def test_normalize_batch_does_not_reenqueue_when_nothing_pending(monkeypatch):
+    calls = []
+
+    class FakeQueue:
+        def enqueue(self, *args, **kwargs):
+            calls.append(("enqueue", args))
+
+        def enqueue_in(self, *args, **kwargs):
+            calls.append(("enqueue_in", args))
+
+    monkeypatch.setattr(processing_jobs, "normalize_events", lambda db, events: {
+        "counts": {"normalized": 1, "failed": 0, "pending": 0},
+        "affected_machines": set(),
+    })
+    monkeypatch.setattr(processing_jobs, "get_queue", lambda: FakeQueue())
+
+    processing_jobs.normalize_batch("00000000-0000-0000-0000-000000000000")
+
+    assert [c for c in calls if c[0] == "enqueue_in"] == []
+
+
 def test_recompute_machine_state_creates_row():
     db = SessionLocal()
     try:

@@ -2,7 +2,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.enums import RawEventStatus
@@ -31,6 +31,12 @@ def ingest_batch(
     than dropped, so nothing silently disappears. Records that already exist
     for this vendor (same native id) are counted as duplicates and skipped —
     re-posting the same batch is a no-op.
+
+    Dedupe is enforced atomically via `ON CONFLICT DO NOTHING` against the
+    `(vendor, native_event_id)` unique constraint, rather than a
+    check-then-insert — two concurrent requests for the same native id (e.g.
+    a vendor retrying a POST) can't both pass a pre-check and then collide
+    on commit; the database resolves the race directly.
     """
     batch = RawBatch(vendor=vendor, raw_payload=envelope_payload)
     db.add(batch)
@@ -39,14 +45,8 @@ def ingest_batch(
     accepted = 0
     duplicates = 0
     rejected = 0
-
-    existing_ids = {
-        row[0]
-        for row in db.execute(
-            select(RawEvent.native_event_id).where(RawEvent.vendor == vendor)
-        ).all()
-    }
     seen_in_batch = set()
+    candidate_rows = []
 
     for record in records:
         native_id = record.get(native_id_field)
@@ -66,21 +66,30 @@ def ingest_batch(
             continue
 
         native_id = str(native_id)
-        if native_id in existing_ids or native_id in seen_in_batch:
+        if native_id in seen_in_batch:
             duplicates += 1
             continue
         seen_in_batch.add(native_id)
-
-        db.add(
-            RawEvent(
-                batch_id=batch.id,
-                vendor=vendor,
-                native_event_id=native_id,
-                raw_record=record,
-                status=RawEventStatus.PENDING.value,
-            )
+        candidate_rows.append(
+            {
+                "batch_id": batch.id,
+                "vendor": vendor,
+                "native_event_id": native_id,
+                "raw_record": record,
+                "status": RawEventStatus.PENDING.value,
+            }
         )
-        accepted += 1
+
+    if candidate_rows:
+        stmt = (
+            pg_insert(RawEvent)
+            .values(candidate_rows)
+            .on_conflict_do_nothing(constraint="uq_raw_events_vendor_native_id")
+            .returning(RawEvent.native_event_id)
+        )
+        inserted_ids = set(db.execute(stmt).scalars().all())
+        accepted = len(inserted_ids)
+        duplicates += len(candidate_rows) - accepted
 
     db.commit()
 

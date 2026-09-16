@@ -1,9 +1,13 @@
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.db.session import SessionLocal
 from app.main import app
+from app.models.enums import RawEventStatus
+from app.models.raw import RawBatch, RawEvent
 
 client = TestClient(app)
 
@@ -122,3 +126,56 @@ def test_ingest_missing_native_id_is_stored_as_rejected_not_dropped():
     assert body["total_records"] == 1
     assert body["rejected"] == 1
     assert body["accepted"] == 0
+
+
+def test_dedupe_is_enforced_atomically_against_a_concurrently_inserted_row():
+    """Regression test for a check-then-insert race: ingest_batch used to
+    query existing native_event_ids and then insert, which two concurrent
+    requests could both pass before either committed. It now uses an atomic
+    ON CONFLICT DO NOTHING insert instead. This simulates "another request
+    already inserted this row" by inserting directly (bypassing
+    ingest_batch's own bookkeeping) right before posting the same id."""
+    native_id = f"PF-RACE-{uuid.uuid4()}"
+    db = SessionLocal()
+    try:
+        batch = RawBatch(vendor="pulseforge", raw_payload={})
+        db.add(batch)
+        db.flush()
+        db.add(
+            RawEvent(
+                batch_id=batch.id,
+                vendor="pulseforge",
+                native_event_id=native_id,
+                raw_record={},
+                status=RawEventStatus.PENDING.value,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    payload = {
+        "vendor": "PulseForge",
+        "plant_id": "PLANT_01",
+        "batch_generated_at": "2026-04-18T09:00:00Z",
+        "events": [
+            {
+                "event_id": native_id,
+                "machine_id": "EQ-001",
+                "line_id": "LINE-A",
+                "event_time": "2026-04-18T09:00:00Z",
+                "event_type": "HIGH_VIBRATION",
+                "severity": "low",
+                "vibration_mm_s": 3.0,
+            }
+        ],
+    }
+    response = client.post(
+        "/v1/ingest/pulseforge",
+        json=payload,
+        headers={"X-Vendor-Key": settings.pulseforge_api_key},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["accepted"] == 0
+    assert body["duplicates"] == 1

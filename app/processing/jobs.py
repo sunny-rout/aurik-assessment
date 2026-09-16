@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from rq import Retry
 from sqlalchemy import select
 
@@ -15,6 +17,15 @@ from app.processing.queue import get_queue
 # re-selects rows still marked pending.
 BATCH_RETRY = Retry(max=3, interval=[10, 30, 60])
 
+# Delay before re-checking a batch that still has records stuck `pending`
+# after an unexpected (not NormalizationError) per-record failure. Without
+# this, normalize_events() swallows the exception internally and the job
+# reports success to RQ, so nothing would ever automatically re-attempt
+# those records — retry_count would be incremented once and then the record
+# would sit pending forever. Re-enqueuing here is what actually drives a
+# record through its retry_count attempts up to MAX_RECORD_RETRIES.
+RECORD_RETRY_DELAY = timedelta(seconds=15)
+
 
 def normalize_batch(batch_id: str) -> dict:
     db = SessionLocal()
@@ -29,6 +40,14 @@ def normalize_batch(batch_id: str) -> dict:
 
         for machine_id in result["affected_machines"]:
             get_queue().enqueue(recompute_machine_state, machine_id)
+
+        if result["counts"]["pending"] > 0:
+            # some records hit an unexpected error and are still pending —
+            # re-run this batch shortly. normalize_events() only re-selects
+            # rows still marked pending, so this is safe to repeat, and each
+            # attempt moves affected records closer to MAX_RECORD_RETRIES,
+            # so this self-reschedule is bounded, not an infinite loop.
+            get_queue().enqueue_in(RECORD_RETRY_DELAY, normalize_batch, batch_id)
 
         return result
     finally:
