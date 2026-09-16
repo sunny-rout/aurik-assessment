@@ -10,11 +10,14 @@ from app.ingestion.schemas import (
     ThermexWatchEnvelope,
 )
 from app.ingestion.service import ingest_batch
+from app.processing.jobs import BATCH_RETRY, normalize_batch
+from app.processing.queue import get_queue
 
 router = APIRouter(prefix="/v1/ingest", tags=["ingestion"])
 
 
 def _to_response(vendor: str, result) -> IngestResponse:
+    get_queue().enqueue(normalize_batch, str(result.batch_id), retry=BATCH_RETRY)
     return IngestResponse(
         batch_id=str(result.batch_id),
         vendor=vendor,
