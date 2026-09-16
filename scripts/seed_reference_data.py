@@ -1,7 +1,8 @@
 """Loads asset_reference.csv and line_reference.csv into the reference tables.
 
 Idempotent: re-running upserts rows by primary key instead of duplicating them,
-so it is safe to run on every container startup.
+so it is safe to run on every container startup. Assumes migrations have already
+created the schema (see `alembic upgrade head`).
 """
 
 import csv
@@ -9,7 +10,7 @@ import os
 from datetime import datetime
 
 from app.config import settings
-from app.db.session import Base, SessionLocal, engine
+from app.db.session import SessionLocal
 from app.models.reference import AssetReference, LineReference
 
 
@@ -62,11 +63,6 @@ def load_line_reference(db, path: str) -> int:
 
 
 def main():
-    Base.metadata.create_all(bind=engine, tables=[
-        AssetReference.__table__,
-        LineReference.__table__,
-    ])
-
     asset_csv = os.path.join(settings.reference_data_dir, "asset_reference.csv")
     line_csv = os.path.join(settings.reference_data_dir, "line_reference.csv")
 
